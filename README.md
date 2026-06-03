@@ -57,6 +57,10 @@ First run generates an access password (printed in the console, saved to
 `http://127.0.0.1:8799`.
 
 ### Configuration (environment variables)
+Copy [`.env.example`](.env.example) → `.env` and load it (systemd
+`EnvironmentFile=`, or `set -a; source .env; set +a`). The app reads these from
+the process environment:
+
 | var | default | purpose |
 |-----|---------|---------|
 | `GROK_WEB_WORKSPACE` | `./workspace` | folder Grok reads/writes; the gallery watches it |
