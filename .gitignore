@@ -1,0 +1,39 @@
+# ── Python venv / bytecode ──────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+.pybin
+
+# ── Secrets & auth — NEVER commit ───────────────────────────────────────
+app/.secret
+app/.password
+.env
+*.key
+*.pem
+**/auth.json
+
+# ── Runtime / personal state ────────────────────────────────────────────
+app/settings.json
+app/.thumbs/
+*.log
+
+# ── Generated media / thumbnails (defense-in-depth; never publish output) ─
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.m4v
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.avif
+*.gif
+
+# ── ffmpeg binary (provided by the imageio-ffmpeg package, see README) ───
+bin/ffmpeg
+
+# ── OS / editor junk ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp

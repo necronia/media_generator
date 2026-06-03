@@ -1,0 +1,307 @@
+#!/home/necronia/grok-studio/.venv/bin/python
+"""videoextend — make a video longer by generating a continuation and joining it.
+
+Two methods:
+  --method concat  (default) : take the LAST frame -> image-to-video -> concatenate.
+                               Less motion-aware, but works with adult content.
+  --method native            : xAI /v1/videos/extensions — the model sees the whole
+                               clip and continues it (smoother), but applies STRICTER
+                               content moderation (may reject adult content).
+
+Usage:
+  videoextend <video> "<motion / scene prompt>" [--method concat|native]
+              [--seconds N] [--resolution 720p] [--loops K] [--out PATH]
+
+Prints:  OK: <output_path>
+"""
+import argparse
+import base64
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+FFMPEG = str(BIN / "ffmpeg")
+IMG2VIDEO = str(BIN / "img2video")
+API = "https://api.x.ai/v1/videos"
+MODEL = "grok-imagine-video"
+ASPECTS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:3": 4 / 3,
+           "3:4": 3 / 4, "3:2": 3 / 2, "2:3": 2 / 3}
+
+
+def _token():
+    d = json.loads(Path("~/.grok/auth.json").expanduser().read_text("utf-8"))
+    v = d[next(iter(d))]
+    return v.get("key") if isinstance(v, dict) else v
+
+
+def _api(method, url, tok, body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _ff(args):
+    return subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", *args],
+                          capture_output=True, text=True)
+
+
+def _probe(video):
+    s = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video)], capture_output=True, text=True).stderr
+    wh = re.search(r",\s*(\d{2,5})x(\d{2,5})", s)
+    fps = re.search(r"(\d+(?:\.\d+)?)\s*fps", s)
+    return (int(wh.group(1)) if wh else 0, int(wh.group(2)) if wh else 0,
+            float(fps.group(1)) if fps else 24.0, "Audio:" in s)
+
+
+def _aspect(W, H):
+    if not W or not H:
+        return None
+    r = W / H
+    return min(ASPECTS, key=lambda k: abs(ASPECTS[k] - r))
+
+
+# ---- native method: xAI /v1/videos/extensions --------------------------------
+def native_extend(src, prompt, seconds, resolution, out):
+    tok = _token()
+    uri = "data:video/mp4;base64," + base64.b64encode(src.read_bytes()).decode()
+    body = {"model": MODEL, "prompt": prompt, "video": {"url": uri}}
+    if seconds:
+        body["extend_duration"] = seconds
+    st, b = _api("POST", API + "/extensions", tok, body, timeout=120)
+    if st != 200:
+        raise SystemExit(f"ERROR native submit ({st}): {b[:300].decode('utf-8','replace')}")
+    rid = json.loads(b).get("request_id")
+    print(f"submitted native extension {rid} — generating…", flush=True)
+    start = time.time()
+    while time.time() - start < 600:
+        time.sleep(8)
+        st, b = _api("GET", f"{API}/{rid}", tok)
+        txt = b.decode("utf-8", "replace")
+        try:
+            j = json.loads(txt)
+        except Exception:
+            continue
+        if st >= 400:   # 202 = still pending; only 4xx/5xx are real errors
+            if "moderation" in txt.lower() or j.get("block_reason"):
+                raise SystemExit("ERROR native extension was BLOCKED by content moderation "
+                                 "(try --method concat instead). " + txt[:200])
+            raise SystemExit(f"ERROR native ({st}): {txt[:200]}")
+        status = j.get("status")
+        print(f"  status={status} progress={j.get('progress')}", flush=True)
+        if status in ("done", "completed"):
+            url = (j.get("video") or {}).get("url")
+            req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                out.write_bytes(r.read())
+            return out
+        if status in ("failed", "expired"):
+            raise SystemExit(f"ERROR native extension {status}: {txt[:200]}")
+    raise SystemExit("ERROR native extension timed out")
+
+
+# ---- concat method: last frame -> img2video -> join --------------------------
+def _last_frame(video, dst):
+    """Grab the EXACT last frame (the seed). -sseof lands a few frames early, which makes the
+    continuation start slightly BEFORE the end -> the video appears to jump back. cv2 reads the
+    true final frame (seek near the end, then read to it)."""
+    try:
+        import cv2
+        c = cv2.VideoCapture(str(video))
+        n = int(c.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        c.set(cv2.CAP_PROP_POS_FRAMES, max(0, n - 30))
+        frame = None
+        while True:
+            ok, f = c.read()
+            if not ok:
+                break
+            frame = f
+        c.release()
+        if frame is not None:
+            cv2.imwrite(str(dst), frame)
+    except Exception:
+        pass
+    if not dst.exists():   # fallback
+        _ff(["-i", str(video), "-vf", "reverse", "-frames:v", "1", str(dst)])
+    if not dst.exists():
+        raise SystemExit("ERROR: could not extract last frame")
+    return dst
+
+
+def _img2video(image, prompt, seconds, resolution, aspect, dst):
+    cmd = [IMG2VIDEO, str(image), prompt, "--duration", str(seconds),
+           "--resolution", resolution, "--out", str(dst)]
+    if aspect:
+        cmd += ["--aspect", aspect]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if not dst.exists():
+        raise SystemExit(f"ERROR img2video failed: {(r.stdout + r.stderr)[-500:]}")
+    return dst
+
+
+def _normalize(video, W, H, F, dst, trim_frames=0):
+    """Re-encode to identical params. trim_frames drops the first N frames (used on the
+    continuation to remove the duplicate seed frame so the two clips butt together cleanly)."""
+    parts = [f"scale={W}:{H}:force_original_aspect_ratio=decrease",
+             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"]
+    af = None
+    if trim_frames > 0:   # drop the first N frames (select is reliable; trim/setpts is not)
+        parts += [f"select=gte(n\\,{trim_frames})", "setpts=PTS-STARTPTS"]
+        af = f"atrim=start={trim_frames / float(F):.4f},asetpts=PTS-STARTPTS"
+    parts += [f"fps={F}", "format=yuv420p"]
+    vf = ",".join(parts)
+    if _probe(video)[3]:
+        args = ["-i", str(video), "-vf", vf] + (["-af", af] if af else [])
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-c:a", "aac", "-ar", "44100", "-ac", "2", str(dst)]
+        _ff(args)
+    else:
+        _ff(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+             "-i", str(video), "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "20", "-c:a", "aac", "-shortest", "-map", "1:v:0", "-map", "0:a:0", str(dst)])
+    if not dst.exists():
+        raise SystemExit("ERROR: normalize failed")
+    return dst
+
+
+def _settle_frames(src, cont, max_drop=10):
+    """Count the continuation's leading 'settling' frames — the ones that hover near the source's
+    last frame (the image-to-video seed) before real new motion starts — so we can drop exactly
+    those and butt the clips together without the 'frames go back then reconnect' feeling."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return 1
+
+    def gray(f):
+        return cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (160, 160)).astype("float32")
+
+    cs = cv2.VideoCapture(str(src))
+    n = int(cs.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cs.set(cv2.CAP_PROP_POS_FRAMES, max(0, n - 9))
+    sf = []
+    while True:
+        ok, f = cs.read()
+        if not ok:
+            break
+        sf.append(gray(f))
+    cs.release()
+    if len(sf) < 2:
+        return 1
+    L = sf[-1]
+    motions = sorted(float(np.abs(sf[i] - sf[i - 1]).mean()) for i in range(1, len(sf)))
+    thr = max(motions[len(motions) // 2], 1.5)   # source's typical per-frame motion (floored)
+    cc = cv2.VideoCapture(str(cont))
+    k = 0
+    for i in range(max_drop + 1):
+        ok, f = cc.read()
+        if not ok:
+            break
+        if float(np.abs(gray(f) - L).mean()) >= thr:   # genuinely moved past the seed
+            k = i
+            break
+        k = i + 1                                       # still hovering near seed -> redundant
+    cc.release()
+    return max(0, min(k, max_drop))
+
+
+def _duration(video):
+    s = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video)], capture_output=True, text=True).stderr
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", s)
+    if m:
+        h, mn, sec = m.groups()
+        return int(h) * 3600 + int(mn) * 60 + float(sec)
+    return 0.0
+
+
+def _xfade_join(a, b, F, dst, xd=0.3):
+    """Crossfade the tail of a into the head of b so the seam doesn't 'pop'."""
+    da = _duration(a)
+    off = max(0.0, da - xd)
+    fc = (f"[0:v][1:v]xfade=transition=fade:duration={xd}:offset={off:.3f}[v];"
+          f"[0:a][1:a]acrossfade=d={xd}[a]")
+    _ff(["-i", str(a), "-i", str(b), "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac",
+         "-r", str(F), "-pix_fmt", "yuv420p", str(dst)])
+    if not dst.exists():
+        raise SystemExit("ERROR: xfade join failed")
+    return dst
+
+
+def concat_extend(src, prompt, seconds, resolution, loops, out, xfade=0.0, trim_frames=1):
+    W, H, F, _ = _probe(src)
+    if not W or not H:
+        raise SystemExit("ERROR: could not read video dimensions")
+    asp = _aspect(W, H)
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        cur = src
+        for i in range(max(1, loops)):
+            print(f"[concat {i + 1}/{loops}] last-frame -> img2video({seconds}s) -> join", flush=True)
+            frame = _last_frame(cur, tmp / f"lf{i}.png")
+            cont = _img2video(frame, prompt, seconds, resolution, asp, tmp / f"c{i}.mp4")
+            nc = _normalize(cur, W, H, F, tmp / f"a{i}.mp4")
+            merged = tmp / f"m{i}.mp4"
+            if xfade and xfade > 0:
+                nk = _normalize(cont, W, H, F, tmp / f"b{i}.mp4")
+                _xfade_join(nc, nk, F, merged, xd=xfade)   # blended seam (dissolve)
+            else:
+                # remove the continuation's leading 'settling' frames (auto), then butt-join
+                drop = trim_frames if trim_frames >= 0 else _settle_frames(cur, cont)
+                print(f"  [join] removing {drop} settling frame(s) from the continuation start", flush=True)
+                nk = _normalize(cont, W, H, F, tmp / f"b{i}.mp4", trim_frames=drop)
+                lst = tmp / f"l{i}.txt"
+                lst.write_text(f"file '{nc}'\nfile '{nk}'\n")
+                _ff(["-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(merged)])
+                if not merged.exists():
+                    raise SystemExit("ERROR: concat failed")
+            cur = merged
+        shutil.copy2(cur, out)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("video")
+    ap.add_argument("prompt")
+    ap.add_argument("--method", default="concat", choices=["concat", "native"])
+    ap.add_argument("--seconds", type=int, default=6)
+    ap.add_argument("--resolution", default="720p")
+    ap.add_argument("--loops", type=int, default=1)
+    ap.add_argument("--xfade", type=float, default=0.0, help="concat seam crossfade seconds (0 = clean hard cut, default)")
+    ap.add_argument("--trim-frames", dest="trim_frames", type=int, default=-1,
+                    help="seed frames to drop off the continuation start; -1 = auto-detect the settling frames (default)")
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+
+    src = Path(a.video).expanduser()
+    if not src.is_file():
+        raise SystemExit(f"ERROR: video not found: {src}")
+    out = Path(a.out).expanduser() if a.out else src.with_name(src.stem + "_extended.mp4")
+    n = 1
+    while out.exists():
+        out = src.with_name(f"{src.stem}_extended_{n}.mp4")
+        n += 1
+
+    if a.method == "native":
+        native_extend(src, a.prompt, a.seconds, a.resolution, out)
+    else:
+        concat_extend(src, a.prompt, a.seconds, a.resolution, a.loops, out,
+                      xfade=a.xfade, trim_frames=a.trim_frames)
+    print(f"OK: {out}")
+
+
+if __name__ == "__main__":
+    main()
